@@ -51,16 +51,16 @@ from typing import (
 )
 
 import requests
-
-from langchain.docstore.document import Document
-from langchain.schema import BaseDocumentTransformer
+from langchain_core.documents import BaseDocumentTransformer, Document
 
 logger = logging.getLogger(__name__)
 
 TS = TypeVar("TS", bound="TextSplitter")
 
 
-def _make_spacy_pipeline_for_splitting(pipeline: str) -> Any:  # avoid importing spacy
+def _make_spacy_pipeline_for_splitting(
+    pipeline: str, *, max_length: int = 1_000_000
+) -> Any:  # avoid importing spacy
     try:
         import spacy
     except ImportError:
@@ -74,6 +74,7 @@ def _make_spacy_pipeline_for_splitting(pipeline: str) -> Any:  # avoid importing
         sentencizer.add_pipe("sentencizer")
     else:
         sentencizer = spacy.load(pipeline, exclude=["ner", "tagger"])
+        sentencizer.max_length = max_length
     return sentencizer
 
 
@@ -390,16 +391,36 @@ class MarkdownHeaderTextSplitter:
         header_stack: List[HeaderType] = []
         initial_metadata: Dict[str, str] = {}
 
+        in_code_block = False
+        opening_fence = ""
+
         for line in lines:
             stripped_line = line.strip()
+
+            if not in_code_block:
+                # Exclude inline code spans
+                if stripped_line.startswith("```") and stripped_line.count("```") == 1:
+                    in_code_block = True
+                    opening_fence = "```"
+                elif stripped_line.startswith("~~~"):
+                    in_code_block = True
+                    opening_fence = "~~~"
+            else:
+                if stripped_line.startswith(opening_fence):
+                    in_code_block = False
+                    opening_fence = ""
+
+            if in_code_block:
+                current_content.append(stripped_line)
+                continue
+
             # Check each line against each of the header types (e.g., #, ##)
             for sep, name in self.headers_to_split_on:
                 # Check if line starts with a header that we intend to split on
                 if stripped_line.startswith(sep) and (
                     # Header with no text OR header is followed by space
                     # Both are valid conditions that sep is being used a header
-                    len(stripped_line) == len(sep)
-                    or stripped_line[len(sep)] == " "
+                    len(stripped_line) == len(sep) or stripped_line[len(sep)] == " "
                 ):
                     # Ensure we are tracking the header as metadata
                     if name is not None:
@@ -628,10 +649,16 @@ class HTMLHeaderTextSplitter:
 # @dataclass(frozen=True, kw_only=True, slots=True)
 @dataclass(frozen=True)
 class Tokenizer:
+    """Tokenizer data class."""
+
     chunk_overlap: int
+    """Overlap in tokens between chunks"""
     tokens_per_chunk: int
-    decode: Callable[[list[int]], str]
+    """Maximum number of tokens per chunk"""
+    decode: Callable[[List[int]], str]
+    """ Function to decode a list of token ids to a string"""
     encode: Callable[[str], List[int]]
+    """ Function to encode a string to a list of token ids"""
 
 
 def split_text_on_tokens(*, text: str, tokenizer: Tokenizer) -> List[str]:
@@ -791,6 +818,7 @@ class Language(str, Enum):
     HTML = "html"
     SOL = "sol"
     CSHARP = "csharp"
+    COBOL = "cobol"
 
 
 class RecursiveCharacterTextSplitter(TextSplitter):
@@ -1285,6 +1313,38 @@ class RecursiveCharacterTextSplitter(TextSplitter):
                 " ",
                 "",
             ]
+        elif language == Language.COBOL:
+            return [
+                # Split along divisions
+                "\nIDENTIFICATION DIVISION.",
+                "\nENVIRONMENT DIVISION.",
+                "\nDATA DIVISION.",
+                "\nPROCEDURE DIVISION.",
+                # Split along sections within DATA DIVISION
+                "\nWORKING-STORAGE SECTION.",
+                "\nLINKAGE SECTION.",
+                "\nFILE SECTION.",
+                # Split along sections within PROCEDURE DIVISION
+                "\nINPUT-OUTPUT SECTION.",
+                # Split along paragraphs and common statements
+                "\nOPEN ",
+                "\nCLOSE ",
+                "\nREAD ",
+                "\nWRITE ",
+                "\nIF ",
+                "\nELSE ",
+                "\nMOVE ",
+                "\nPERFORM ",
+                "\nUNTIL ",
+                "\nVARYING ",
+                "\nACCEPT ",
+                "\nDISPLAY ",
+                "\nSTOP RUN.",
+                # Split by the normal type of lines
+                "\n",
+                " ",
+                "",
+            ]
 
         else:
             raise ValueError(
@@ -1323,16 +1383,24 @@ class SpacyTextSplitter(TextSplitter):
     """Splitting text using Spacy package.
 
 
-    Per default, Spacy's `en_core_web_sm` model is used. For a faster, but
+    Per default, Spacy's `en_core_web_sm` model is used and
+    its default max_length is 1000000 (it is the length of maximum character
+    this model takes which can be increased for large files). For a faster, but
     potentially less accurate splitting, you can use `pipeline='sentencizer'`.
     """
 
     def __init__(
-        self, separator: str = "\n\n", pipeline: str = "en_core_web_sm", **kwargs: Any
+        self,
+        separator: str = "\n\n",
+        pipeline: str = "en_core_web_sm",
+        max_length: int = 1_000_000,
+        **kwargs: Any,
     ) -> None:
         """Initialize the spacy text splitter."""
         super().__init__(**kwargs)
-        self._tokenizer = _make_spacy_pipeline_for_splitting(pipeline)
+        self._tokenizer = _make_spacy_pipeline_for_splitting(
+            pipeline, max_length=max_length
+        )
         self._separator = separator
 
     def split_text(self, text: str) -> List[str]:
